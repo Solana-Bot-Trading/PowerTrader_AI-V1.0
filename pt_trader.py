@@ -52,6 +52,11 @@ _gui_settings_cache = {
 	"pm_start_pct_no_dca": 5.0,
 	"pm_start_pct_with_dca": 2.5,
 	"trailing_gap_pct": 0.5,
+	
+	# Account mode settings (new - backward compatible)
+	"account_mode": "auto",
+	"small_account_threshold": 2500,
+	"small_account_settings": {},
 }
 
 
@@ -177,6 +182,16 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["trailing_gap_pct"] = trailing_gap_pct
 
 
+		# --- Small account mode settings (new - backward compatible) ---
+		account_mode = data.get("account_mode", "auto")
+		small_threshold = float(data.get("small_account_threshold", 2500))
+		small_settings = data.get("small_account_settings", {})
+
+		_gui_settings_cache["account_mode"] = account_mode
+		_gui_settings_cache["small_account_threshold"] = small_threshold
+		_gui_settings_cache["small_account_settings"] = small_settings
+
+
 		return {
 			"mtime": mtime,
 			"coins": list(coins),
@@ -190,6 +205,11 @@ def _load_gui_settings() -> dict:
 			"pm_start_pct_no_dca": pm_start_pct_no_dca,
 			"pm_start_pct_with_dca": pm_start_pct_with_dca,
 			"trailing_gap_pct": trailing_gap_pct,
+			
+			# Small account mode fields
+			"account_mode": account_mode,
+			"small_account_threshold": small_threshold,
+			"small_account_settings": small_settings,
 		}
 
 
@@ -370,6 +390,16 @@ class CryptoAPITrading:
             float(self.pm_start_pct_with_dca),
         )
 
+        # --- Tiered profit taking (per-coin state) ---
+        # { "BTC": {"orig_qty": float, 1: bool, 2: bool} }
+        self.tiered_profits = {}
+
+        # Tier settings — 0.0 pct = disabled (falls back to plain trailing stop)
+        self.profit_tier1_pct      = 0.0
+        self.profit_tier1_fraction = 0.33
+        self.profit_tier2_pct      = 0.0
+        self.profit_tier2_fraction = 0.50
+
 
 
         self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
@@ -399,6 +429,166 @@ class CryptoAPITrading:
         self._dca_buy_ts = {}         # { "BTC": [ts, ts, ...] } (DCA buys only)
         self._dca_last_sell_ts = {}   # { "BTC": ts_of_last_sell }
         self._seed_dca_window_from_history()
+
+        # Apply account tier-specific settings (small account optimizations)
+        self._apply_account_tier_settings()
+
+
+
+
+
+    def _apply_account_tier_settings(self):
+        """
+        Detect account size and apply appropriate settings overrides.
+        Falls back to existing globals if account_mode is not 'small' or 'auto'.
+        This method is backward compatible - if account_mode is missing or set to
+        'force_existing', no changes are made.
+        """
+        try:
+            settings = _load_gui_settings()
+            account_mode = settings.get("account_mode", "auto")
+            
+            # If mode is 'force_existing', use existing behavior but load from settings
+            if account_mode == "force_existing":
+                print("Account mode: FORCE_EXISTING - Using current production settings")
+                # Still load the settings values (don't use hardcoded defaults)
+                self.start_allocation_pct = float(START_ALLOC_PCT)
+                self.dca_multiplier = float(DCA_MULTIPLIER)
+                return
+            
+            # Get account value to determine tier.
+            # Uses get_account() (buying_power) + get_holdings() (holdings value) so the
+            # total reflects actual portfolio value, not just uninvested cash.
+            try:
+                _acct = self.get_account()
+                _bp = float(_acct.get("buying_power", 0.0) or 0.0)
+                _holdings = self.get_holdings()
+                _holdings_val = 0.0
+                for _h in _holdings.get("results", []):
+                    try:
+                        _qty = float(_h.get("total_quantity", 0.0) or 0.0)
+                        _cost = float(_h.get("cost_held_for_display", 0.0) or 0.0)
+                        _holdings_val += _cost if _cost > 0 else 0.0
+                    except Exception:
+                        pass
+                account_value = _bp + _holdings_val
+                if account_value <= 0.0:
+                    # Fallback: use buying_power alone if holdings parse failed
+                    account_value = _bp
+                if account_value <= 0.0:
+                    raise ValueError("Account value is zero or negative")
+            except Exception as _e:
+                print(f"Warning: Could not get account value for tier detection ({_e}). Using standard settings.")
+                return
+            
+            small_threshold = settings.get("small_account_threshold", 2500)
+            
+            # Determine if small account settings should apply
+            should_use_small = (
+                account_mode == "small" or 
+                (account_mode == "auto" and account_value < small_threshold)
+            )
+            
+            if not should_use_small:
+                print(f"[STANDARD MODE] Account: ${account_value:,.2f} - Using standard settings")
+                self.start_allocation_pct = float(START_ALLOC_PCT)
+                self.dca_multiplier = float(DCA_MULTIPLIER)
+                self.hard_stop_enabled = False
+                self.hard_stop_pct = -35.0
+                self.max_positions = 999
+                self.reserve_minimum_pct = 0.0
+                self.require_neural_dca_confirmation = False
+                # Tiered profits: disabled in standard mode unless configured at top level
+                self.profit_tier1_pct      = float(settings.get("profit_tier1_pct", 0.0))
+                self.profit_tier1_fraction = float(settings.get("profit_tier1_fraction", 0.33))
+                self.profit_tier2_pct      = float(settings.get("profit_tier2_pct", 0.0))
+                self.profit_tier2_fraction = float(settings.get("profit_tier2_fraction", 0.50))
+                return
+            
+            # Apply small account overrides
+            print(f"[SMALL ACCOUNT MODE] Account: ${account_value:,.2f} - Using small account optimizations")
+            
+            small = settings.get("small_account_settings", {})
+            
+            if not small:
+                print("  Warning: small_account_settings not configured. Using standard settings.")
+                return
+            
+            # Override instance variables with small account settings
+            if "start_allocation_pct" in small:
+                self.start_allocation_pct = float(small["start_allocation_pct"])
+            else:
+                self.start_allocation_pct = float(START_ALLOC_PCT)
+                
+            if "dca_multiplier" in small:
+                self.dca_multiplier = float(small["dca_multiplier"])
+            else:
+                self.dca_multiplier = float(DCA_MULTIPLIER)
+                
+            if "dca_levels" in small:
+                self.dca_levels = list(small["dca_levels"])
+            
+            if "max_dca_buys_per_24h" in small:
+                self.max_dca_buys_per_24h = int(small["max_dca_buys_per_24h"])
+                
+            if "pm_start_pct_no_dca" in small:
+                self.pm_start_pct_no_dca = float(small["pm_start_pct_no_dca"])
+                
+            if "pm_start_pct_with_dca" in small:
+                self.pm_start_pct_with_dca = float(small["pm_start_pct_with_dca"])
+                
+            if "trailing_gap_pct" in small:
+                self.trailing_gap_pct = float(small["trailing_gap_pct"])
+            
+            # New small-account-only features
+            self.hard_stop_enabled = small.get("hard_stop_enabled", False)
+            self.hard_stop_pct = float(small.get("hard_stop_pct", -35.0))
+            self.max_positions = int(small.get("max_positions", 999))
+            self.reserve_minimum_pct = float(small.get("reserve_minimum_pct", 0.0))
+            self.require_neural_dca_confirmation = small.get("require_neural_dca_confirmation", True)
+
+            # Tiered profit taking (small account; 0.0 pct = disabled)
+            self.profit_tier1_pct      = float(small.get("profit_tier1_pct", 7.0))
+            self.profit_tier1_fraction = float(small.get("profit_tier1_fraction", 0.33))
+            self.profit_tier2_pct      = float(small.get("profit_tier2_pct", 15.0))
+            self.profit_tier2_fraction = float(small.get("profit_tier2_fraction", 0.50))
+
+            # Update trailing settings signature for state reset detection
+            self._last_trailing_settings_sig = (
+                float(self.trailing_gap_pct),
+                float(self.pm_start_pct_no_dca),
+                float(self.pm_start_pct_with_dca),
+            )
+
+            print(f"  * Initial position: {self.start_allocation_pct:.2f}%")
+            print(f"  * DCA multiplier: {self.dca_multiplier:.1f}x")
+            print(f"  * DCA levels: {self.dca_levels}")
+            print(f"  * Profit targets: {self.pm_start_pct_no_dca:.1f}% / {self.pm_start_pct_with_dca:.1f}%")
+            print(f"  * Hard stop: {self.hard_stop_pct:.1f}% (enabled={self.hard_stop_enabled})")
+            print(f"  * Max positions: {self.max_positions}")
+            print(f"  * Reserve minimum: {self.reserve_minimum_pct:.1f}%")
+            t1_pct = self.profit_tier1_pct
+            t2_pct = self.profit_tier2_pct
+            if t1_pct > 0.0:
+                print(f"  * Tiered profits: T1=+{t1_pct:.1f}% (sell {self.profit_tier1_fraction*100:.0f}%)  "
+                      f"T2=+{t2_pct:.1f}% (sell {self.profit_tier2_fraction*100:.0f}% of remainder)  Trail rest")
+            else:
+                print(f"  * Tiered profits: DISABLED (full trailing stop)")
+
+        except Exception as e:
+            print(f"Warning: Could not apply account tier settings: {e}")
+            print("Continuing with standard settings...")
+            self.hard_stop_enabled = False
+            self.hard_stop_pct = -35.0
+            self.max_positions = 999
+            self.reserve_minimum_pct = 0.0
+            self.require_neural_dca_confirmation = False
+            self.start_allocation_pct = float(START_ALLOC_PCT)
+            self.dca_multiplier = float(DCA_MULTIPLIER)
+            self.profit_tier1_pct      = 0.0
+            self.profit_tier1_fraction = 0.33
+            self.profit_tier2_pct      = 0.0
+            self.profit_tier2_fraction = 0.50
 
 
 
@@ -1542,6 +1732,103 @@ class CryptoAPITrading:
 
 
 
+    def _check_hard_stop_loss(self, symbol: str, gain_loss_pct: float, 
+                              quantity: float, full_symbol: str, 
+                              avg_cost_basis: float = 0.0) -> bool:
+        """
+        Check and execute hard stop loss if enabled in small account settings.
+        Returns True if position was closed, False otherwise.
+        
+        This is opt-in via small_account_settings.hard_stop_enabled.
+        If not enabled, this method does nothing (preserves existing behavior).
+        """
+        # Only active if explicitly enabled in settings
+        if not getattr(self, 'hard_stop_enabled', False):
+            return False
+        
+        hard_stop = getattr(self, 'hard_stop_pct', -35.0)
+        
+        if gain_loss_pct <= hard_stop:
+            # One-time neural override: if network is screaming L7, allow one more chance
+            neural_level = self._read_long_dca_signal(symbol)
+            override_key = f"{symbol}_stop_override"
+            
+            if not hasattr(self, '_stop_overrides'):
+                self._stop_overrides = {}
+            
+            if neural_level >= 7 and not self._stop_overrides.get(override_key, False):
+                print(
+                    f"  [WARNING] HARD STOP at {gain_loss_pct:.1f}% BUT neural L{neural_level} "
+                    f"is screaming BUY. Allowing ONE more chance to recover."
+                )
+                self._stop_overrides[override_key] = True
+                return False
+            
+            print(
+                f"  [HARD STOP] {symbol} at {gain_loss_pct:.1f}%. "
+                f"Force exiting {quantity:.8f} units to preserve capital."
+            )
+            
+            response = self.place_sell_order(
+                str(uuid.uuid4()),
+                "sell",
+                "market",
+                full_symbol,
+                quantity,
+                avg_cost_basis=avg_cost_basis,
+                pnl_pct=gain_loss_pct,
+                tag="HARD_STOP",
+            )
+            
+            if response and "errors" not in response:
+                # Cleanup state
+                self.dca_levels_triggered.pop(symbol, None)
+                self.trailing_pm.pop(symbol, None)
+                self.tiered_profits.pop(symbol, None)
+                if hasattr(self, '_stop_overrides'):
+                    self._stop_overrides.pop(override_key, None)
+                return True
+        
+        return False
+
+    def _check_position_limits(self, symbol: str, additional_capital: float) -> bool:
+        """
+        Check if adding capital to a position would violate position limits.
+        Returns True if okay to proceed, False if limit would be exceeded.
+        
+        Checks:
+        - Max positions limit
+        - Reserve requirement
+        - Per-coin capital limit (future enhancement)
+        """
+        # Check reserve requirement
+        if hasattr(self, 'reserve_minimum_pct') and self.reserve_minimum_pct > 0:
+            try:
+                _acct2 = self.get_account()
+                buying_power = float(_acct2.get("buying_power", 0.0) or 0.0)
+                # Estimate total account value = buying_power + cost of held positions
+                _h2 = self.get_holdings()
+                _held_cost = 0.0
+                for _hh in _h2.get("results", []):
+                    try:
+                        _held_cost += float(_hh.get("cost_held_for_display", 0.0) or 0.0)
+                    except Exception:
+                        pass
+                account_value = buying_power + _held_cost if (_held_cost > 0) else buying_power
+                reserve_required = account_value * (self.reserve_minimum_pct / 100.0)
+                
+                if buying_power - additional_capital < reserve_required:
+                    print(
+                        f"  [WARNING] Reserve requirement (${reserve_required:.2f}, "
+                        f"{self.reserve_minimum_pct:.1f}%) would be violated. "
+                        f"Skipping trade."
+                    )
+                    return False
+            except Exception:
+                pass
+        
+        return True
+
 
 
     def manage_trades(self):
@@ -1675,10 +1962,19 @@ class CryptoAPITrading:
         print(f"Total Account Value: ${total_account_value:.2f}")
         print(f"Holdings Value: ${holdings_sell_value:.2f}")
         print(f"Percent In Trade: {in_use:.2f}%")
-        print(
-            f"Trailing PM: start +{self.pm_start_pct_no_dca:.2f}% (no DCA) / +{self.pm_start_pct_with_dca:.2f}% (with DCA) "
-            f"| gap {self.trailing_gap_pct:.2f}%"
-        )
+        _t1 = float(getattr(self, "profit_tier1_pct", 0.0))
+        _t2 = float(getattr(self, "profit_tier2_pct", 0.0))
+        if _t1 > 0.0:
+            print(
+                f"Profit Mode: TIERED  T1=+{_t1:.1f}% ({float(getattr(self, 'profit_tier1_fraction', 0.33))*100:.0f}%)  "
+                f"T2=+{_t2:.1f}% ({float(getattr(self, 'profit_tier2_fraction', 0.50))*100:.0f}% of remainder)  "
+                f"Trail rest | gap {self.trailing_gap_pct:.2f}%"
+            )
+        else:
+            print(
+                f"Trailing PM: start +{self.pm_start_pct_no_dca:.2f}% (no DCA) / +{self.pm_start_pct_with_dca:.2f}% (with DCA) "
+                f"| gap {self.trailing_gap_pct:.2f}%"
+            )
         print("\n--- Current Trades ---")
 
         positions = {}
@@ -1847,17 +2143,102 @@ class CryptoAPITrading:
                 print("  PM/Trail: N/A (avg_cost_basis is 0)")
 
 
+            # --- HARD STOP LOSS CHECK (before trailing PM) ---
+            # Only active if enabled in small account settings
+            if self._check_hard_stop_loss(symbol, gain_loss_percentage_buy, quantity, full_symbol, avg_cost_basis):
+                # Position was force-closed due to hard stop
+                trades_made = True
+                time.sleep(5)
+                holdings = self.get_holdings()
+                continue
 
-            # --- Trailing profit margin (0.5% trail gap) ---
-            # PM "start line" is the normal 5% / 2.5% line (depending on DCA levels hit).
-            # Trailing activates once price is ABOVE the PM start line, then line follows peaks up
-            # by 0.5%. Forced sell happens ONLY when price goes from ABOVE the trailing line to BELOW it.
+
+            # --- Tiered profit taking + trailing stop ---
+            # Tier 1 (e.g. +7%):  sell profit_tier1_fraction of ORIGINAL qty.
+            # Tier 2 (e.g. +15%): sell profit_tier2_fraction of ORIGINAL qty.
+            # Remainder:          trail with trailing_gap_pct until cross-below triggers full exit.
+            # If tier pcts are 0.0 the tiers are skipped and the full position trails as before.
             if avg_cost_basis > 0:
                 pm_start_pct = self.pm_start_pct_no_dca if int(triggered_levels) == 0 else self.pm_start_pct_with_dca
                 base_pm_line = avg_cost_basis * (1.0 + (pm_start_pct / 100.0))
-                trail_gap = self.trailing_gap_pct / 100.0  # 0.5% => 0.005
+                trail_gap = self.trailing_gap_pct / 100.0
 
-                # If trailing settings changed since this coin's state was created, reset it.
+                t1_pct  = float(getattr(self, "profit_tier1_pct", 0.0))
+                t1_frac = float(getattr(self, "profit_tier1_fraction", 0.33))
+                t2_pct  = float(getattr(self, "profit_tier2_pct", 0.0))
+                t2_frac = float(getattr(self, "profit_tier2_fraction", 0.50))
+
+                # Init or retrieve per-coin tier state; orig_qty captured on first sight.
+                tier_state = self.tiered_profits.get(symbol)
+                if tier_state is None:
+                    tier_state = {"orig_qty": quantity, 1: False, 2: False}
+                    self.tiered_profits[symbol] = tier_state
+                # Reset if position has grown (fresh entry after full exit)
+                if quantity > tier_state.get("orig_qty", 0.0) * 1.01:
+                    tier_state = {"orig_qty": quantity, 1: False, 2: False}
+                    self.tiered_profits[symbol] = tier_state
+
+                orig_qty = float(tier_state["orig_qty"])
+
+                # --- Tier 1 partial sell ---
+                if t1_pct > 0.0 and (not tier_state[1]) and gain_loss_percentage_sell >= t1_pct:
+                    tier1_qty = round(orig_qty * t1_frac, 8)
+                    tier1_qty = min(tier1_qty, quantity)
+                    if tier1_qty > 0.0:
+                        print(
+                            f"  [TIER 1] {symbol} reached +{gain_loss_percentage_sell:.2f}% "
+                            f"(target +{t1_pct:.1f}%). Selling {tier1_qty:.8f} "
+                            f"({t1_frac*100:.0f}% of original position)."
+                        )
+                        response = self.place_sell_order(
+                            str(uuid.uuid4()),
+                            "sell",
+                            "market",
+                            full_symbol,
+                            tier1_qty,
+                            expected_price=current_sell_price,
+                            avg_cost_basis=avg_cost_basis,
+                            pnl_pct=gain_loss_percentage_sell,
+                            tag="TIER1_SELL",
+                        )
+                        if response and isinstance(response, dict) and "errors" not in response:
+                            tier_state[1] = True
+                            trades_made = True
+                            print(f"  Tier 1 sell placed for {symbol}. Holding remainder.")
+                            time.sleep(5)
+                            holdings = self.get_holdings()
+                            continue
+
+                # --- Tier 2 partial sell ---
+                if t2_pct > 0.0 and tier_state[1] and (not tier_state[2]) and gain_loss_percentage_sell >= t2_pct:
+                    tier2_qty = round(orig_qty * t2_frac, 8)
+                    tier2_qty = min(tier2_qty, quantity)
+                    if tier2_qty > 0.0:
+                        print(
+                            f"  [TIER 2] {symbol} reached +{gain_loss_percentage_sell:.2f}% "
+                            f"(target +{t2_pct:.1f}%). Selling {tier2_qty:.8f} "
+                            f"({t2_frac*100:.0f}% of original position)."
+                        )
+                        response = self.place_sell_order(
+                            str(uuid.uuid4()),
+                            "sell",
+                            "market",
+                            full_symbol,
+                            tier2_qty,
+                            expected_price=current_sell_price,
+                            avg_cost_basis=avg_cost_basis,
+                            pnl_pct=gain_loss_percentage_sell,
+                            tag="TIER2_SELL",
+                        )
+                        if response and isinstance(response, dict) and "errors" not in response:
+                            tier_state[2] = True
+                            trades_made = True
+                            print(f"  Tier 2 sell placed for {symbol}. Trailing remainder.")
+                            time.sleep(5)
+                            holdings = self.get_holdings()
+                            continue
+
+                # --- Trailing stop on remainder (or full position if tiers disabled) ---
                 settings_sig = (
                     float(self.trailing_gap_pct),
                     float(self.pm_start_pct_no_dca),
@@ -1875,28 +2256,19 @@ class CryptoAPITrading:
                     }
                     self.trailing_pm[symbol] = state
                 else:
-                    # Keep signature up to date
                     state["settings_sig"] = settings_sig
-
-                    # IMPORTANT:
-                    # If trailing hasn't activated yet, this is just the PM line.
-                    # It MUST track the current avg_cost_basis (so it can move DOWN after each DCA).
                     if not state.get("active", False):
                         state["line"] = base_pm_line
                     else:
-                        # Once trailing is active, the line should never be below the base PM start line.
                         if state.get("line", 0.0) < base_pm_line:
                             state["line"] = base_pm_line
 
-                # Use SELL price because that's what you actually get when you market sell
                 above_now = current_sell_price >= state["line"]
 
-                # Activate trailing once we first get above the base PM line
                 if (not state["active"]) and above_now:
                     state["active"] = True
                     state["peak"] = current_sell_price
 
-                # If active, update peak and move trailing line up behind it
                 if state["active"]:
                     if current_sell_price > state["peak"]:
                         state["peak"] = current_sell_price
@@ -1907,7 +2279,6 @@ class CryptoAPITrading:
                     if new_line > state["line"]:
                         state["line"] = new_line
 
-                    # Forced sell on cross from ABOVE -> BELOW trailing line
                     if state["was_above"] and (current_sell_price < state["line"]):
                         print(
                             f"  Trailing PM hit for {symbol}. "
@@ -1927,7 +2298,8 @@ class CryptoAPITrading:
 
                         if response and isinstance(response, dict) and "errors" not in response:
                             trades_made = True
-                            self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
+                            self.trailing_pm.pop(symbol, None)
+                            self.tiered_profits.pop(symbol, None)
 
                             # Trade ended -> reset rolling 24h DCA window for this coin
                             self._reset_dca_window_for_trade(symbol, sold=True)
@@ -1937,8 +2309,7 @@ class CryptoAPITrading:
                             holdings = self.get_holdings()
                             continue
 
-
-                # Save this tick’s position relative to the line (needed for “above -> below” detection)
+                # Save this tick's position relative to the line (needed for "above -> below" detection)
                 state["was_above"] = above_now
 
 
@@ -1968,7 +2339,17 @@ class CryptoAPITrading:
                 # Keep it sane: don't DCA from neural if we're not even below cost basis.
                 neural_hit = (gain_loss_percentage_buy < 0) and (neural_level_now >= neural_level_needed)
 
-            if hard_hit or neural_hit:
+            # Small account mode: require neural confirmation for DCA
+            require_neural = getattr(self, 'require_neural_dca_confirmation', False)
+            
+            if require_neural and hard_hit and not neural_hit and current_stage < len(self.dca_levels):
+                # Loss threshold hit but neural not confirming - skip DCA
+                print(
+                    f"  [WARNING] DCA stage {current_stage + 1} loss threshold {hard_level:.1f}% hit, "
+                    f"but neural L{neural_level_now or 0} < required L{neural_level_needed}. "
+                    f"Skipping DCA - waiting for neural confirmation (small account mode)."
+                )
+            elif hard_hit or neural_hit:
                 if neural_hit and hard_hit:
                     reason = f"NEURAL L{neural_level_now}>=L{neural_level_needed} OR HARD {hard_level:.2f}%"
                 elif neural_hit:
@@ -1979,13 +2360,21 @@ class CryptoAPITrading:
                 print(f"  DCAing {symbol} (stage {current_stage + 1}) via {reason}.")
 
                 print(f"  Current Value: ${value:.2f}")
-                dca_amount = value * float(DCA_MULTIPLIER or 0.0)
-                print(f"  DCA Amount: ${dca_amount:.2f}")
+                
+                # Use DCA multiplier from settings (could be 1.0 for linear, 2.0 for exponential)
+                dca_multiplier = getattr(self, 'dca_multiplier', float(DCA_MULTIPLIER or 2.0))
+                dca_amount = value * dca_multiplier
+                
+                print(f"  DCA Amount: ${dca_amount:.2f} ({dca_multiplier:.1f}x position value)")
                 print(f"  Buying Power: ${buying_power:.2f}")
-
-
+                
+                # Check recent DCA count for this symbol
                 recent_dca = self._dca_window_count(symbol)
-                if recent_dca >= int(getattr(self, "max_dca_buys_per_24h", 2)):
+                
+                # Check position limits before DCA
+                if not self._check_position_limits(symbol, dca_amount):
+                    pass  # Already printed warning in check method
+                elif recent_dca >= int(getattr(self, "max_dca_buys_per_24h", 2)):
                     print(
                         f"  Skipping DCA for {symbol}. "
                         f"Already placed {recent_dca} DCA buys in the last 24h (max {self.max_dca_buys_per_24h})."
@@ -2011,9 +2400,10 @@ class CryptoAPITrading:
                         # Only record a DCA buy timestamp on success (so skips never advance anything)
                         self._note_dca_buy(symbol)
 
-                        # DCA changes avg_cost_basis, so the PM line must be rebuilt from the new basis
+                        # DCA changes avg_cost_basis, so the PM line and tier state must be rebuilt.
                         # (this will re-init to 5% if DCA=0, or 2.5% if DCA>=1)
                         self.trailing_pm.pop(symbol, None)
+                        self.tiered_profits.pop(symbol, None)
 
                         trades_made = True
                         print(f"  Successfully placed DCA buy order for {symbol}.")
@@ -2074,13 +2464,32 @@ class CryptoAPITrading:
 
 
 
-        alloc_pct = float(START_ALLOC_PCT or 0.005)
+        # Position sizing - use instance variable if set by account tier, otherwise global
+        # NOTE: start_allocation_pct is ALREADY a percentage (e.g., 10.0 means 10%)
+        # The global START_ALLOC_PCT might be stored as 0.005 (old format) or 10.0 (new format)
+        # Instance variable is always set correctly by _apply_account_tier_settings
+        if hasattr(self, 'start_allocation_pct'):
+            alloc_pct = float(self.start_allocation_pct)
+        else:
+            alloc_pct = float(START_ALLOC_PCT or 0.005)
+        
         allocation_in_usd = total_account_value * (alloc_pct / 100.0)
+        
+        # Minimum allocation safety
         if allocation_in_usd < 0.5:
             allocation_in_usd = 0.5
+        
+        # Debug output (no emojis for Windows compatibility)
+        print(f"\n[ALLOCATION] Position Sizing: {alloc_pct:.3f}% of ${total_account_value:.2f} = ${allocation_in_usd:.2f}")
+        if allocation_in_usd == 0.5:
+            print(f"   (Minimum $0.50 enforced)")
 
 
         holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
+        
+        # Check max positions limit for new entries
+        max_positions = getattr(self, 'max_positions', 999)
+        current_positions = len(holdings.get("results", []))
 
         start_index = 0
         while start_index < len(crypto_symbols):
@@ -2089,6 +2498,14 @@ class CryptoAPITrading:
 
             # Skip if already held
             if full_symbol in holding_full_symbols:
+                start_index += 1
+                continue
+            
+            # Skip if at max positions limit
+            if current_positions >= max_positions:
+                # Don't spam this message for every coin
+                if start_index == 0:
+                    print(f"  [WARNING] Max positions ({max_positions}) reached. No new entries allowed.")
                 start_index += 1
                 continue
 
@@ -2100,6 +2517,11 @@ class CryptoAPITrading:
 
             # Default behavior: long must be >= start_level and short must be 0
             if not (buy_count >= start_level and sell_count == 0):
+                start_index += 1
+                continue
+            
+            # Check position limits (reserve requirement, etc)
+            if not self._check_position_limits(base_symbol, allocation_in_usd):
                 start_index += 1
                 continue
 
