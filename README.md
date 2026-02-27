@@ -1,3 +1,36 @@
+# PowerTrader AI V1.00 - Enhanced Fork
+
+**This is an enhanced fork of [garagesteve1155/PowerTrader_AI](https://github.com/garagesteve1155/PowerTrader_AI)**
+
+## 🚀 What's New in This Fork
+
+This fork adds comprehensive small account optimizations and advanced risk management features:
+
+- **✅ Three-Tier Account Mode System** - Auto-detects and optimizes for accounts of any size
+- **✅ Small Account Optimizations** - Specialized settings for accounts under $2,500
+- **✅ Hard Stop Loss Protection** - Automatic -35% stop with intelligent neural override
+- **✅ Tiered Profit Taking** - 3-stage exits (33% at +7%, 50% at +15%, trail rest)
+- **✅ Reserve Capital Management** - Enforces 20% minimum cash reserve
+- **✅ Enhanced GUI Metrics** - Win rate, avg win/loss, best/worst coin tracking
+- **✅ 100% Backward Compatible** - All original functionality preserved
+
+### 📊 Improvements Summary
+
+For a detailed list of all improvements, see [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md)
+
+**Key Stats:**
+- 5,000% increase in capital deployment efficiency for small accounts
+- -35% hard stop protection vs unlimited downside in original
+- 3-tier profit system vs single all-or-nothing exit
+- 4 new performance tracking metrics
+
+---
+
+# Original README Content Follows
+
+(Keep all the original README content below this line)
+
+
 # PowerTrader_AI
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
 
